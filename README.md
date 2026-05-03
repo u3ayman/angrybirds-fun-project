@@ -172,7 +172,7 @@ From the project directory (folder containing `Game.cpp`):
 ```text
 C:\msys64\mingw64\bin\g++.exe -std=c++20 Game.cpp -o Game.exe ^
   -I C:\msys64\mingw64\include -L C:\msys64\mingw64\lib ^
-  -lsfml-graphics -lsfml-window -lsfml-system -lbox2d
+  -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio -lbox2d
 ```
 
 Adjust paths if your MSYS2 install is not `C:\msys64`.
@@ -216,9 +216,22 @@ Multimedia Game/
 
 | Library | Role |
 |---------|------|
-| **SFML 3** | Window, rendering, input, timing |
+| **SFML 3** | Window, rendering, input, timing, **audio** |
 | **Box2D 3** | 2D rigid-body physics |
 | **C++20 compiler** | `std::optional`, designated initializers, etc. |
+
+### Sounds (optional but expected)
+
+Place these files next to `Game.exe` (same folder as `Game.cpp` when running from the project directory):
+
+| File | When it plays |
+|------|----------------|
+| `weew.mp3` | When the red bird is **launched** (mouse release after drag) |
+| `ooh.mp3` | When a **pig dies** (HP reaches zero or bird overlap kill) |
+
+If a file fails to load, the game still runs; that sound is simply skipped.
+
+After linking **`-lsfml-audio`**, copy any new DLLs Windows asks for (often `libsfml-audio-3.dll` and codecs such as **Vorbis/FLAC/Ogg** from `C:\msys64\mingw64\bin`) beside the executable, or add `mingw64\bin` to `PATH`.
 
 ---
 

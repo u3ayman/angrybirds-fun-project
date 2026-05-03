@@ -1,13 +1,21 @@
+// Angry Birds–style prototype: one .cpp file, SFML 3 (graphics + audio) + Box2D 3 (physics).
+// Flow: create world → load level (pigs, blocks, bird) → stabilize tower → main loop (input,
+// physics step, rules, draw). Box2D uses meters; SFML uses pixels — kPixelsPerMeter converts.
+
+#include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>
 #include <box2d/box2d.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
+// Anonymous namespace: helpers, types, and functions here are only visible inside this .cpp file.
 namespace
 {
+// --- Tunables: sizes, gameplay feel, stabilization thresholds -----------------
 constexpr float kPixelsPerMeter = 30.0f;
 constexpr float kWindowWidth = 1280.0f;
 constexpr float kWindowHeight = 720.0f;
@@ -24,8 +32,9 @@ constexpr float kBirdOneShotDamage = 9999.0f;
 constexpr float kPigMaxHealth = 200.0f;
 constexpr float kLevelDamageWarmupSeconds = 0.75f;
 constexpr float kBirdWakeThresholdSpeed2 = 0.04f;
-constexpr float kStabilizeSpeedThreshold2 = 0.0025f; // (m/s)^2
+constexpr float kStabilizeSpeedThreshold2 = 0.0025f; // (m/s)^2 — used to detect "settled" during pre-sim
 
+// --- Coordinate and vector helpers (screen pixels vs physics meters) --------
 sf::Vector2f ToPixels(const b2Vec2& meters)
 {
     return { meters.x * kPixelsPerMeter, meters.y * kPixelsPerMeter };
@@ -64,6 +73,8 @@ sf::Vector2f ClampPull(const sf::Vector2f& origin, const sf::Vector2f& dragged)
     return origin + Normalize(delta) * kMaxPullDistancePx;
 }
 
+// --- Game object types --------------------------------------------------------
+// Each moving thing has: (1) b2BodyId in Box2D, (2) an SFML shape for drawing.
 struct Bird
 {
     b2BodyId bodyId = b2_nullBodyId;
@@ -98,7 +109,8 @@ struct BodyTag
 {
     Kind kind = Kind::Unknown;
     Material material = Material::Ice;
-    int index = -1; // pig index for Kind::Pig, unused otherwise
+    // For pigs: index into the pigs[] vector so hit events know which pig was hit.
+    int index = -1;
 };
 
 struct Pig
@@ -116,12 +128,14 @@ struct BlockSpec
     Material material = Material::Wood;
 };
 
+// Level data is all in pixels; loadLevel() converts/clamps positions then creates bodies.
 struct Level
 {
     std::vector<sf::Vector2f> pigCentersPx;
     std::vector<BlockSpec> blocks;
 };
 
+// Block color by material (visual only; damage uses MaterialDamageMultiplier).
 sf::Color MaterialColor(Material material)
 {
     switch (material)
@@ -150,6 +164,8 @@ float MaterialDamageMultiplier(Material material)
     }
 }
 
+// --- Physics entity factories (Box2D body + shape, then SFML drawable) ----------
+// Static boxes: ground, walls, ceiling — never move, infinite mass (density 0).
 b2BodyId CreateStaticBoxBody(b2WorldId worldId, const sf::Vector2f& centerPx, const sf::Vector2f& sizePx)
 {
     b2BodyDef bodyDef = b2DefaultBodyDef();
@@ -172,6 +188,7 @@ b2BodyId CreateStaticBoxBody(b2WorldId worldId, const sf::Vector2f& centerPx, co
     return bodyId;
 }
 
+// Bird: dynamic circle; userData points at BodyTag so collisions can identify it.
 Bird CreateBird(b2WorldId worldId, BodyTag* tag)
 {
     Bird bird;
@@ -211,6 +228,7 @@ Bird CreateBird(b2WorldId worldId, BodyTag* tag)
     return bird;
 }
 
+// Block: dynamic box by default; bodyType kept for flexibility (currently always dynamic in loadLevel).
 Block CreateBlock(b2WorldId worldId, const sf::Vector2f& centerPx, const sf::Vector2f& sizePx, Material material, BodyTag* tag, b2BodyType bodyType)
 {
     Block block;
@@ -249,6 +267,7 @@ Block CreateBlock(b2WorldId worldId, const sf::Vector2f& centerPx, const sf::Vec
     return block;
 }
 
+// Pig: dynamic circle target; index in BodyTag routes hit events to pigs[i].
 Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2BodyType bodyType)
 {
     Pig pig;
@@ -283,6 +302,7 @@ Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2B
     return pig;
 }
 
+// Copy physics transform to the drawable each frame (position + rotation from b2Rot).
 void SyncShapeWithBody(sf::Shape& shape, b2BodyId bodyId)
 {
     const b2Vec2 position = b2Body_GetPosition(bodyId);
@@ -293,6 +313,7 @@ void SyncShapeWithBody(sf::Shape& shape, b2BodyId bodyId)
     shape.setRotation(sf::radians(angleRadians));
 }
 
+// Cheap circle overlap in pixel space (used for bird instant-kill on pig touch).
 bool AreBodiesOverlappingAsCircles(b2BodyId a, float aRadiusPx, b2BodyId b, float bRadiusPx)
 {
     const sf::Vector2f aPx = ToPixels(b2Body_GetPosition(a));
@@ -302,6 +323,7 @@ bool AreBodiesOverlappingAsCircles(b2BodyId a, float aRadiusPx, b2BodyId b, floa
     return (d.x * d.x + d.y * d.y) <= (r * r);
 }
 
+// Safe destroy: Box2D bodies must be explicitly destroyed when reloading a level.
 void DestroyIfValid(b2BodyId& bodyId)
 {
     if (B2_IS_NON_NULL(bodyId))
@@ -314,12 +336,47 @@ void DestroyIfValid(b2BodyId& bodyId)
 
 int main()
 {
+    // --- Window (SFML 3: VideoMode takes Vector2u for width/height) ------------
     sf::RenderWindow window(
         sf::VideoMode(sf::Vector2u(static_cast<unsigned int>(kWindowWidth), static_cast<unsigned int>(kWindowHeight))),
         "Angry Birds Prototype"
     );
     window.setFramerateLimit(60);
 
+    // --- Sounds: short SFX from MP3 (load fails silently if files missing) -----
+    // SoundBuffer holds decoded samples; Sound plays them. optional<Sound> because SFML 3 Sound
+    // has no default ctor — we only construct when load succeeds. Buffers must outlive Sounds.
+    sf::SoundBuffer bufferLaunch;
+    sf::SoundBuffer bufferPigDeath;
+    const bool launchSoundLoaded = bufferLaunch.loadFromFile("weew.mp3");
+    const bool pigDeathSoundLoaded = bufferPigDeath.loadFromFile("ooh.mp3");
+    std::optional<sf::Sound> soundLaunch;
+    std::optional<sf::Sound> soundPigDeath;
+    if (launchSoundLoaded)
+    {
+        soundLaunch.emplace(bufferLaunch);
+    }
+    if (pigDeathSoundLoaded)
+    {
+        soundPigDeath.emplace(bufferPigDeath);
+    }
+
+    auto playLaunchSound = [&]()
+    {
+        if (soundLaunch.has_value())
+        {
+            soundLaunch->play();
+        }
+    };
+    auto playPigDeathSound = [&]()
+    {
+        if (soundPigDeath.has_value())
+        {
+            soundPigDeath->play();
+        }
+    };
+
+    // --- Box2D world ------------------------------------------------------------
     b2WorldDef worldDef = b2DefaultWorldDef();
     worldDef.gravity = b2Vec2{ 0.0f, 9.8f };
     worldDef.hitEventThreshold = 0.25f;
@@ -332,6 +389,7 @@ int main()
     // Ceiling (prevents launching into infinity).
     CreateStaticBoxBody(worldId, { kWindowWidth * 0.5f, 0.0f }, { kWindowWidth, 80.0f });
 
+    // --- Level definitions (positions in pixels; edited to design each stage) ---
     const std::vector<Level> levels = {
         Level{
             .pigCentersPx = { sf::Vector2f{ 980.0f, 520.0f } },
@@ -389,16 +447,22 @@ int main()
 
     std::size_t currentLevelIndex = 0;
 
+    // --- Runtime state for current level ----------------------------------------
     Bird bird;
     std::vector<Pig> pigs;
     std::vector<Block> blocks;
+    // Parallel tags[i] for bird + each pig + each block; pointers stored in body userData.
     std::vector<BodyTag> tags;
+    // After load, ignore block→pig damage briefly so stabilization doesn't kill pigs.
     float damageWarmupRemaining = 0.0f;
 
     const float groundTopY = kWindowHeight - kGroundHeight;
     constexpr int kMaxBirdsPerLevel = 4;
     int birdsRemaining = kMaxBirdsPerLevel;
     float birdIdleSeconds = 0.0f;
+
+    // Run physics in the background until pigs/blocks are slow long enough, then zero velocity
+    // and sleep bodies so the first visible frame looks like a finished, stable building.
     auto stabilizeLevel = [&]()
     {
         // Pre-simulate until the structure naturally settles, then start the level asleep and stable.
@@ -471,6 +535,7 @@ int main()
         }
     };
 
+    // Tear down previous bodies, spawn level from data, pre-simulate, reset lives.
     auto loadLevel = [&](std::size_t levelIndex)
     {
         DestroyIfValid(bird.bodyId);
@@ -525,6 +590,7 @@ int main()
 
     loadLevel(currentLevelIndex);
 
+    // --- Purely visual scene elements (not physics bodies) ----------------------
     sf::RectangleShape groundShape({ kWindowWidth, kGroundHeight });
     groundShape.setPosition(sf::Vector2f{ 0.0f, kWindowHeight - kGroundHeight });
     groundShape.setFillColor(sf::Color(80, 140, 80));
@@ -541,6 +607,7 @@ int main()
     sf::Clock clock;
 
     bool paused = false;
+    // No bitmap font: HUD is the window title string (level, pig count, birds left).
     auto updateTitle = [&]()
     {
         if (paused)
@@ -567,8 +634,11 @@ int main()
 
     updateTitle();
 
+    // ======================== Main loop =========================================
+    // Each frame: events → physics + rules → sync drawables → render.
     while (window.isOpen())
     {
+        // --- Input (SFML 3: pollEvent returns optional<Event>) -------------------
         while (const std::optional event = window.pollEvent())
         {
             if (event->is<sf::Event::Closed>())
@@ -600,6 +670,7 @@ int main()
             }
             else if (const auto* pressed = event->getIf<sf::Event::MouseButtonPressed>())
             {
+                // Start drag if click is near bird and this bird hasn't been launched yet.
                 if (!bird.launched && pressed->button == sf::Mouse::Button::Left)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(pressed->position.x), static_cast<float>(pressed->position.y));
@@ -613,6 +684,7 @@ int main()
             }
             else if (const auto* moved = event->getIf<sf::Event::MouseMoved>())
             {
+                // While dragging: clamp rubber-band, teleport bird body, clear velocity (slingshot aim).
                 if (bird.dragging)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(moved->position.x), static_cast<float>(moved->position.y));
@@ -625,6 +697,7 @@ int main()
             }
             else if (const auto* released = event->getIf<sf::Event::MouseButtonReleased>())
             {
+                // Release: fire bird — impulse from pull vector, spend one life, play launch SFX.
                 if (bird.dragging && released->button == sf::Mouse::Button::Left)
                 {
                     bird.dragging = false;
@@ -639,6 +712,7 @@ int main()
                     const b2Vec2 impulse = b2Vec2{ pullMeters.x * kLaunchStrength, pullMeters.y * kLaunchStrength };
                     b2Body_SetAwake(bird.bodyId, true);
                     b2Body_ApplyLinearImpulseToCenter(bird.bodyId, impulse, true);
+                    playLaunchSound();
                 }
             }
         }
@@ -647,9 +721,10 @@ int main()
         if (!paused)
         {
             damageWarmupRemaining = std::max(0.0f, damageWarmupRemaining - dt);
+            // Advance simulation; subStepCount 4 is a typical accuracy/speed tradeoff.
             b2World_Step(worldId, dt, 4);
 
-            // Damage system using Box2D hit events.
+            // --- Pig damage from collisions (Box2D hit events from last step) -----
             const b2ContactEvents contactEvents = b2World_GetContactEvents(worldId);
             for (int i = 0; i < contactEvents.hitCount; ++i)
             {
@@ -694,13 +769,13 @@ int main()
                 float damage = 0.0f;
                 if (otherTag.kind == Kind::Bird)
                 {
-                    damage = kBirdOneShotDamage;
+                    damage = kBirdOneShotDamage; // Huge value: always exceeds pig HP.
                 }
                 else if (otherTag.kind == Kind::Block)
                 {
                     if (damageWarmupRemaining > 0.0f)
                     {
-                        continue;
+                        continue; // No block crush damage during post-load warmup.
                     }
                     // Convert approach speed into damage with a material multiplier.
                     // Tuned for "game feel", not real physics.
@@ -714,13 +789,14 @@ int main()
                     {
                         hitPig.health = 0.0f;
                         hitPig.alive = false;
+                        playPigDeathSound();
                         updateTitle();
                     }
                 }
             }
         }
 
-        // Bird one-shots pigs on contact.
+        // Backup kill: if bird circle overlaps pig circle, kill pig (handles edge cases vs hit events).
         if (!paused && bird.launched)
         {
             for (Pig& p : pigs)
@@ -729,12 +805,13 @@ int main()
                 {
                     p.alive = false;
                     p.health = 0.0f;
+                    playPigDeathSound();
                     updateTitle();
                 }
             }
         }
 
-        // Win: all pigs eliminated -> next level.
+        // --- Level clear: no pigs left → advance cyclic through levels[] ------------
         if (!paused)
         {
             bool anyAlive = false;
@@ -755,7 +832,7 @@ int main()
             }
         }
 
-        // Lose/next bird: if bird is out of bounds or comes to rest.
+        // --- Bird spent: despawn when off-screen or nearly stopped; respawn or fail level -------
         if (!paused && bird.launched && B2_IS_NON_NULL(bird.bodyId))
         {
             const sf::Vector2f birdPx = ToPixels(b2Body_GetPosition(bird.bodyId));
@@ -796,6 +873,7 @@ int main()
             }
         }
 
+        // --- Sync physics → sprites (dragging bird uses mouse position, not body) --------------
         if (bird.dragging)
         {
             bird.shape.setPosition(bird.dragPositionPx);
@@ -818,6 +896,7 @@ int main()
             SyncShapeWithBody(block.shape, block.bodyId);
         }
 
+        // --- Draw frame -------------------------------------------------------------
         window.clear(sf::Color(150, 200, 255));
         window.draw(groundShape);
         window.draw(slingBase);
@@ -873,6 +952,6 @@ int main()
         window.display();
     }
 
-    b2DestroyWorld(worldId);
+    b2DestroyWorld(worldId); // Free all Box2D memory when window closes.
     return 0;
 }
