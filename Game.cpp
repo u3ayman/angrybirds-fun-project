@@ -5,12 +5,12 @@
 #include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>
 #include <box2d/box2d.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <optional>
+#include <string>
 #include <vector>
 
 // Anonymous namespace: helpers, types, and functions here are only visible inside this .cpp file.
@@ -47,6 +47,19 @@ constexpr const char* kBackgroundTextureCandidates[] = {
     "Backgournd.jpg", // filename as on disk (typo in asset name)
     "Background.jpg",
 };
+constexpr const char* kSlingshotTextureCandidates[] = {
+    "R.png",
+};
+
+// Slingshot art: scaled height in pixels; origin Y = fraction from top of image (fork / band area).
+constexpr float kSlingshotSpriteHeightPx = 120.0f;
+constexpr float kSlingshotOriginYFrac = 0.22f;
+
+// Stars at level clear (by how many birds were launched this level). Score += stars * this value.
+constexpr int kScorePerStarStep = 1000;
+// After the star overlay appears, wait this long before playing stars.mp3 (so the sting matches the visuals).
+constexpr float kVictoryStarsSoundDelaySeconds = 0.55f;
+constexpr float kFailureJingleDelaySeconds = 0.4f;
 
 bool LoadFirstAvailableTexture(sf::Texture& tex, const char* const* paths, std::size_t pathCount)
 {
@@ -299,12 +312,6 @@ Block CreateBlock(b2WorldId worldId, const sf::Vector2f& centerPx, const sf::Vec
     block.shape.setOrigin(sf::Vector2f{ sizePx.x * 0.5f, sizePx.y * 0.5f });
     block.shape.setFillColor(MaterialColor(material));
 
-    // Placeholder texture code for a sprite-based version:
-    // sf::Texture woodTexture;
-    // woodTexture.loadFromFile("assets/wood.png");
-    // sf::Sprite woodSprite;
-    // woodSprite.setTexture(woodTexture);
-
     return block;
 }
 
@@ -382,6 +389,71 @@ void DestroyIfValid(b2BodyId& bodyId)
         bodyId = b2_nullBodyId;
     }
 }
+
+bool HasLivingPigs(const std::vector<Pig>& pigs)
+{
+    for (const Pig& p : pigs)
+    {
+        if (p.alive)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Fewer birds used = more stars. Messages are custom labels for each tier.
+struct LevelClearRating
+{
+    int stars;             // 1..3
+    const char* message;   // shown on the level-clear screen
+};
+
+LevelClearRating RateLevelByBirdsUsed(int birdsUsed)
+{
+    if (birdsUsed <= 1)
+    {
+        return { 3, "Gamid" };
+    }
+    if (birdsUsed <= 3)
+    {
+        return { 2, "3ash" };
+    }
+    return { 1, "ygy mnk" };
+}
+
+int ScoreDeltaForStars(int stars)
+{
+    return stars * kScorePerStarStep;
+}
+
+bool LoadUiFont(sf::Font& outFont)
+{
+    static constexpr const char* kFontPaths[] = {
+        "arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    };
+    for (const char* path : kFontPaths)
+    {
+        if (outFont.openFromFile(path))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Places text so (centerX, y) is the center of the string bounds.
+void CenterTextAt(sf::Text& text, float centerX, float y)
+{
+    const sf::FloatRect b = text.getLocalBounds();
+    text.setOrigin(sf::Vector2f{
+        b.position.x + b.size.x * 0.5f,
+        b.position.y + b.size.y * 0.5f,
+    });
+    text.setPosition(sf::Vector2f{ centerX, y });
+}
 } // namespace
 
 int main()
@@ -398,10 +470,13 @@ int main()
     // has no default ctor — we only construct when load succeeds. Buffers must outlive Sounds.
     sf::SoundBuffer bufferLaunch;
     sf::SoundBuffer bufferPigDeath;
+    sf::SoundBuffer bufferIntro;
     const bool launchSoundLoaded = bufferLaunch.loadFromFile("weew.mp3");
     const bool pigDeathSoundLoaded = bufferPigDeath.loadFromFile("ooh.mp3");
+    const bool introSoundLoaded = bufferIntro.loadFromFile("intro.mp3");
     std::optional<sf::Sound> soundLaunch;
     std::optional<sf::Sound> soundPigDeath;
+    std::optional<sf::Sound> soundIntro;
     if (launchSoundLoaded)
     {
         soundLaunch.emplace(bufferLaunch);
@@ -410,6 +485,13 @@ int main()
     {
         soundPigDeath.emplace(bufferPigDeath);
     }
+    if (introSoundLoaded)
+    {
+        soundIntro.emplace(bufferIntro);
+    }
+
+    // Streamed MP3 for level-end jingles (SoundBuffer often fails or glitches on longer MP3s).
+    sf::Music endSceneMusic;
 
     auto playLaunchSound = [&]()
     {
@@ -425,15 +507,45 @@ int main()
             soundPigDeath->play();
         }
     };
+    auto stopAllShortSounds = [&]()
+    {
+        if (soundLaunch.has_value())
+        {
+            soundLaunch->stop();
+        }
+        if (soundPigDeath.has_value())
+        {
+            soundPigDeath->stop();
+        }
+        if (soundIntro.has_value())
+        {
+            soundIntro->stop();
+        }
+    };
+
+    auto playEndSceneMusicFile = [&](const char* path) -> bool
+    {
+        endSceneMusic.stop();
+        stopAllShortSounds();
+        if (!endSceneMusic.openFromFile(path))
+        {
+            return false;
+        }
+        endSceneMusic.setVolume(100.0f);
+        endSceneMusic.play();
+        return true;
+    };
 
     // --- Textures: flag PNG for bird, images.png for pigs, Backgournd.jpg / Background.jpg (solid fallback if missing) ---
     sf::Texture textureBird;
     sf::Texture texturePig;
     sf::Texture textureBackground;
+    sf::Texture textureSling;
     {
         constexpr std::size_t kBirdTexCount = sizeof(kBirdTextureCandidates) / sizeof(kBirdTextureCandidates[0]);
         constexpr std::size_t kPigTexCount = sizeof(kPigTextureCandidates) / sizeof(kPigTextureCandidates[0]);
         constexpr std::size_t kBgTexCount = sizeof(kBackgroundTextureCandidates) / sizeof(kBackgroundTextureCandidates[0]);
+        constexpr std::size_t kSlingTexCount = sizeof(kSlingshotTextureCandidates) / sizeof(kSlingshotTextureCandidates[0]);
         if (!LoadFirstAvailableTexture(textureBird, kBirdTextureCandidates, kBirdTexCount))
         {
             MakeSolidTexture(textureBird, sf::Color(220, 50, 50));
@@ -445,6 +557,10 @@ int main()
         if (!LoadFirstAvailableTexture(textureBackground, kBackgroundTextureCandidates, kBgTexCount))
         {
             MakeSolidTexture(textureBackground, sf::Color(150, 200, 255));
+        }
+        if (!LoadFirstAvailableTexture(textureSling, kSlingshotTextureCandidates, kSlingTexCount))
+        {
+            MakeSolidTexture(textureSling, sf::Color(120, 80, 40));
         }
     }
 
@@ -458,6 +574,21 @@ int main()
                 kWindowHeight / static_cast<float>(texSize.y),
             });
         }
+    }
+
+    sf::Sprite slingSprite(textureSling);
+    {
+        const sf::Vector2u texSize = textureSling.getSize();
+        if (texSize.x > 0u && texSize.y > 0u)
+        {
+            const float scale = kSlingshotSpriteHeightPx / static_cast<float>(texSize.y);
+            slingSprite.setScale(sf::Vector2f{ scale, scale });
+            slingSprite.setOrigin(sf::Vector2f{
+                static_cast<float>(texSize.x) * 0.5f,
+                static_cast<float>(texSize.y) * kSlingshotOriginYFrac,
+            });
+        }
+        slingSprite.setPosition(sf::Vector2f{ kSlingshotX, kSlingshotY });
     }
 
     // --- Box2D world ------------------------------------------------------------
@@ -545,6 +676,24 @@ int main()
     constexpr int kMaxBirdsPerLevel = 4;
     int birdsRemaining = kMaxBirdsPerLevel;
     float birdIdleSeconds = 0.0f;
+    // Counts how many times the player released a shot this level (used for stars at level clear).
+    int birdsUsedThisLevel = 0;
+    int totalScore = 0;
+    int scoreGainedLastClear = 0;
+
+    bool victoryScreenActive = false;
+    int victoryStars = 0;
+    std::string victoryMessage;
+    bool victoryStarsJinglePlayed = false;
+    float victoryStarsJingleTimer = -1.0f;
+
+    bool failureScreenActive = false;
+    bool failureJinglePlayed = false;
+    float failureJingleTimer = -1.0f;
+    static constexpr const char* kFailureMessage = "7sl 5eir";
+
+    sf::Font uiFont;
+    const bool uiFontLoaded = LoadUiFont(uiFont);
 
     // Run physics in the background until pigs/blocks are slow long enough, then zero velocity
     // and sleep bodies so the first visible frame looks like a finished, stable building.
@@ -623,6 +772,18 @@ int main()
     // Tear down previous bodies, spawn level from data, pre-simulate, reset lives.
     auto loadLevel = [&](std::size_t levelIndex)
     {
+        victoryScreenActive = false;
+        victoryStars = 0;
+        victoryMessage.clear();
+        victoryStarsJinglePlayed = false;
+        victoryStarsJingleTimer = -1.0f;
+        failureScreenActive = false;
+        failureJinglePlayed = false;
+        failureJingleTimer = -1.0f;
+        endSceneMusic.stop();
+        scoreGainedLastClear = 0;
+        birdsUsedThisLevel = 0;
+
         if (bird.has_value())
         {
             DestroyIfValid(bird->bodyId);
@@ -678,15 +839,15 @@ int main()
 
     loadLevel(currentLevelIndex);
 
+    if (soundIntro.has_value())
+    {
+        soundIntro->play();
+    }
+
     // --- Purely visual scene elements (not physics bodies) ----------------------
     sf::RectangleShape groundShape({ kWindowWidth, kGroundHeight });
     groundShape.setPosition(sf::Vector2f{ 0.0f, kWindowHeight - kGroundHeight });
     groundShape.setFillColor(sf::Color(80, 140, 80));
-
-    sf::RectangleShape slingBase(sf::Vector2f(10.0f, 90.0f));
-    slingBase.setOrigin(sf::Vector2f{ 5.0f, 90.0f });
-    slingBase.setPosition(sf::Vector2f{ kSlingshotX - 20.0f, kSlingshotY + 10.0f });
-    slingBase.setFillColor(sf::Color(120, 80, 40));
 
     sf::VertexArray aimLine(sf::PrimitiveType::Lines, 2);
     aimLine[0].color = sf::Color(40, 40, 40, 180);
@@ -695,9 +856,22 @@ int main()
     sf::Clock clock;
 
     bool paused = false;
-    // No bitmap font: HUD is the window title string (level, pig count, birds left).
+    // Window title = quick HUD (also shows total score).
     auto updateTitle = [&]()
     {
+        if (victoryScreenActive)
+        {
+            window.setTitle(
+                "Level clear!  " + std::to_string(victoryStars) + " stars  Score: " + std::to_string(totalScore) +
+                "  Press Space for next level"
+            );
+            return;
+        }
+        if (failureScreenActive)
+        {
+            window.setTitle("Out of birds!  0 stars  Press Space to retry this level");
+            return;
+        }
         if (paused)
         {
             window.setTitle("Paused - [Esc] Resume  [R] Restart  [Q] Quit");
@@ -716,7 +890,8 @@ int main()
         window.setTitle(
             "Angry Birds Prototype - Level " + std::to_string(static_cast<int>(currentLevelIndex + 1)) +
             " - Pigs: " + std::to_string(alivePigs) +
-            " - Birds: " + std::to_string(birdsRemaining)
+            " - Birds: " + std::to_string(birdsRemaining) +
+            " - Score: " + std::to_string(totalScore)
         );
     };
 
@@ -735,10 +910,28 @@ int main()
             }
             else if (const auto* key = event->getIf<sf::Event::KeyPressed>())
             {
-                if (key->code == sf::Keyboard::Key::Escape)
+                if (failureScreenActive &&
+                    (key->code == sf::Keyboard::Key::Space || key->code == sf::Keyboard::Key::Enter))
                 {
-                    paused = !paused;
+                    loadLevel(currentLevelIndex);
+                    paused = false;
                     updateTitle();
+                }
+                else if (victoryScreenActive &&
+                         (key->code == sf::Keyboard::Key::Space || key->code == sf::Keyboard::Key::Enter))
+                {
+                    currentLevelIndex = (currentLevelIndex + 1) % levels.size();
+                    loadLevel(currentLevelIndex);
+                    paused = false;
+                    updateTitle();
+                }
+                else if (key->code == sf::Keyboard::Key::Escape)
+                {
+                    if (!victoryScreenActive && !failureScreenActive)
+                    {
+                        paused = !paused;
+                        updateTitle();
+                    }
                 }
                 else if (paused && (key->code == sf::Keyboard::Key::R))
                 {
@@ -751,15 +944,15 @@ int main()
                     window.close();
                 }
             }
-            else if (paused)
+            else if (paused || victoryScreenActive || failureScreenActive)
             {
-                // Ignore gameplay input while paused.
+                // Ignore slingshot input while paused or on an end-of-level overlay.
                 continue;
             }
             else if (const auto* pressed = event->getIf<sf::Event::MouseButtonPressed>())
             {
                 // Start drag if click is near bird and this bird hasn't been launched yet.
-                if (!bird->launched && pressed->button == sf::Mouse::Button::Left)
+                if (bird.has_value() && !bird->launched && pressed->button == sf::Mouse::Button::Left)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(pressed->position.x), static_cast<float>(pressed->position.y));
                     const sf::Vector2f birdCenterPx = ToPixels(b2Body_GetPosition(bird->bodyId));
@@ -773,7 +966,7 @@ int main()
             else if (const auto* moved = event->getIf<sf::Event::MouseMoved>())
             {
                 // While dragging: clamp rubber-band, teleport bird body, clear velocity (slingshot aim).
-                if (bird->dragging)
+                if (bird.has_value() && bird->dragging)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(moved->position.x), static_cast<float>(moved->position.y));
                     bird->dragPositionPx = ClampPull({ kSlingshotX, kSlingshotY }, mousePx);
@@ -786,10 +979,11 @@ int main()
             else if (const auto* released = event->getIf<sf::Event::MouseButtonReleased>())
             {
                 // Release: fire bird — impulse from pull vector, spend one life, play launch SFX.
-                if (bird->dragging && released->button == sf::Mouse::Button::Left)
+                if (bird.has_value() && bird->dragging && released->button == sf::Mouse::Button::Left)
                 {
                     bird->dragging = false;
                     bird->launched = true;
+                    ++birdsUsedThisLevel;
                     birdsRemaining = std::max(0, birdsRemaining - 1);
                     birdIdleSeconds = 0.0f;
                     updateTitle();
@@ -806,7 +1000,29 @@ int main()
         }
 
         const float dt = clock.restart().asSeconds();
-        if (!paused)
+        const bool gameplayFrozen = paused || victoryScreenActive || failureScreenActive;
+
+        // Level-end jingles: countdown then stream MP3 (more reliable than SoundBuffer for some files).
+        if (victoryScreenActive && !victoryStarsJinglePlayed)
+        {
+            victoryStarsJingleTimer -= dt;
+            if (victoryStarsJingleTimer <= 0.0f)
+            {
+                static_cast<void>(playEndSceneMusicFile("stars.mp3"));
+                victoryStarsJinglePlayed = true;
+            }
+        }
+        if (failureScreenActive && !failureJinglePlayed)
+        {
+            failureJingleTimer -= dt;
+            if (failureJingleTimer <= 0.0f)
+            {
+                static_cast<void>(playEndSceneMusicFile("wawawawa.mp3"));
+                failureJinglePlayed = true;
+            }
+        }
+
+        if (!gameplayFrozen)
         {
             damageWarmupRemaining = std::max(0.0f, damageWarmupRemaining - dt);
             // Advance simulation; subStepCount 4 is a typical accuracy/speed tradeoff.
@@ -885,7 +1101,7 @@ int main()
         }
 
         // Backup kill: if bird circle overlaps pig circle, kill pig (handles edge cases vs hit events).
-        if (!paused && bird->launched)
+        if (!gameplayFrozen && bird.has_value() && bird->launched)
         {
             for (Pig& p : pigs)
             {
@@ -899,29 +1115,23 @@ int main()
             }
         }
 
-        // --- Level clear: no pigs left → advance cyclic through levels[] ------------
-        if (!paused)
+        // --- Level clear: all pigs gone → stars + score, then wait for [Space] on overlay ---
+        if (!gameplayFrozen && !failureScreenActive && !victoryScreenActive && !HasLivingPigs(pigs))
         {
-            bool anyAlive = false;
-            for (const Pig& p : pigs)
-            {
-                if (p.alive)
-                {
-                    anyAlive = true;
-                    break;
-                }
-            }
-
-            if (!anyAlive)
-            {
-                currentLevelIndex = (currentLevelIndex + 1) % levels.size();
-                loadLevel(currentLevelIndex);
-                updateTitle();
-            }
+            const LevelClearRating rating = RateLevelByBirdsUsed(birdsUsedThisLevel);
+            victoryStars = rating.stars;
+            victoryMessage = rating.message;
+            scoreGainedLastClear = ScoreDeltaForStars(victoryStars);
+            totalScore += scoreGainedLastClear;
+            victoryScreenActive = true;
+            paused = false;
+            victoryStarsJinglePlayed = false;
+            victoryStarsJingleTimer = kVictoryStarsSoundDelaySeconds;
+            updateTitle();
         }
 
         // --- Bird spent: despawn when off-screen or nearly stopped; respawn or fail level -------
-        if (!paused && bird->launched && B2_IS_NON_NULL(bird->bodyId))
+        if (!gameplayFrozen && bird.has_value() && bird->launched && B2_IS_NON_NULL(bird->bodyId))
         {
             const sf::Vector2f birdPx = ToPixels(b2Body_GetPosition(bird->bodyId));
             const float margin = 200.0f;
@@ -952,9 +1162,17 @@ int main()
                     bird.emplace(CreateBird(worldId, &tags[0], textureBird));
                     updateTitle();
                 }
+                else if (HasLivingPigs(pigs))
+                {
+                    // No birds left but pigs survive: 0-star fail screen, then Space to retry.
+                    failureScreenActive = true;
+                    paused = false;
+                    failureJinglePlayed = false;
+                    failureJingleTimer = kFailureJingleDelaySeconds;
+                    updateTitle();
+                }
                 else
                 {
-                    // Out of lives: restart this level.
                     loadLevel(currentLevelIndex);
                     updateTitle();
                 }
@@ -962,13 +1180,16 @@ int main()
         }
 
         // --- Sync physics → sprites (dragging bird uses mouse position, not body) --------------
-        if (bird->dragging)
+        if (bird.has_value())
         {
-            bird->sprite.setPosition(bird->dragPositionPx);
-        }
-        else
-        {
-            SyncSpriteWithBody(bird->sprite, bird->bodyId);
+            if (bird->dragging)
+            {
+                bird->sprite.setPosition(bird->dragPositionPx);
+            }
+            else
+            {
+                SyncSpriteWithBody(bird->sprite, bird->bodyId);
+            }
         }
 
         for (Pig& p : pigs)
@@ -988,10 +1209,10 @@ int main()
         window.clear(sf::Color(150, 200, 255));
         window.draw(backgroundSprite);
         window.draw(groundShape);
-        window.draw(slingBase);
+        window.draw(slingSprite);
 
         // Aiming helpers (line + trajectory preview).
-        if (bird->dragging)
+        if (bird.has_value() && bird->dragging)
         {
             const sf::Vector2f slingshotOriginPx(kSlingshotX, kSlingshotY);
             aimLine[0].position = slingshotOriginPx;
@@ -1026,7 +1247,10 @@ int main()
             }
         }
 
-        window.draw(bird->sprite);
+        if (bird.has_value())
+        {
+            window.draw(bird->sprite);
+        }
         for (const Pig& p : pigs)
         {
             if (p.alive)
@@ -1038,6 +1262,109 @@ int main()
         {
             window.draw(block.shape);
         }
+
+        // Level clear: dim the scene, draw stars + rating message + score (needs a .ttf if you want text).
+        if (victoryScreenActive)
+        {
+            sf::RectangleShape shade(sf::Vector2f{ kWindowWidth, kWindowHeight });
+            shade.setFillColor(sf::Color(0, 0, 0, 170));
+            window.draw(shade);
+
+            constexpr float kStarSpacing = 52.0f;
+            constexpr float kStarY = 185.0f;
+            for (int i = 0; i < 3; ++i)
+            {
+                sf::CircleShape star(16.0f);
+                star.setOrigin(sf::Vector2f{ 16.0f, 16.0f });
+                star.setPosition(sf::Vector2f{
+                    kWindowWidth * 0.5f + (static_cast<float>(i) - 1.0f) * kStarSpacing,
+                    kStarY,
+                });
+                star.setFillColor(i < victoryStars ? sf::Color(255, 220, 60) : sf::Color(70, 70, 75));
+                window.draw(star);
+            }
+
+            if (uiFontLoaded)
+            {
+                sf::Text heading(uiFont, "Level complete!", 42u);
+                heading.setFillColor(sf::Color::White);
+                CenterTextAt(heading, kWindowWidth * 0.5f, 280.0f);
+                window.draw(heading);
+
+                sf::Text msg(uiFont, "", 36u);
+                msg.setString(victoryMessage);
+                msg.setFillColor(sf::Color(255, 230, 150));
+                CenterTextAt(msg, kWindowWidth * 0.5f, 345.0f);
+                window.draw(msg);
+
+                const std::string scoreStr =
+                    "This level: +" + std::to_string(scoreGainedLastClear) + "     Total score: " + std::to_string(totalScore);
+                sf::Text scoreLine(uiFont, scoreStr, 26u);
+                scoreLine.setFillColor(sf::Color(220, 220, 230));
+                CenterTextAt(scoreLine, kWindowWidth * 0.5f, 410.0f);
+                window.draw(scoreLine);
+
+                sf::Text hint(uiFont, "Press Space to go to the next level", 22u);
+                hint.setFillColor(sf::Color(180, 200, 255));
+                CenterTextAt(hint, kWindowWidth * 0.5f, 500.0f);
+                window.draw(hint);
+            }
+        }
+
+        // Ran out of birds with pigs left: 0 stars, fail message, Space to retry this level.
+        if (failureScreenActive)
+        {
+            sf::RectangleShape shade(sf::Vector2f{ kWindowWidth, kWindowHeight });
+            shade.setFillColor(sf::Color(40, 0, 0, 190));
+            window.draw(shade);
+
+            constexpr float kStarSpacing = 52.0f;
+            constexpr float kStarY = 185.0f;
+            for (int i = 0; i < 3; ++i)
+            {
+                sf::CircleShape star(16.0f);
+                star.setOrigin(sf::Vector2f{ 16.0f, 16.0f });
+                star.setPosition(sf::Vector2f{
+                    kWindowWidth * 0.5f + (static_cast<float>(i) - 1.0f) * kStarSpacing,
+                    kStarY,
+                });
+                star.setFillColor(sf::Color(55, 55, 60));
+                window.draw(star);
+            }
+
+            if (uiFontLoaded)
+            {
+                sf::Text heading(uiFont, "Out of birds!", 42u);
+                heading.setFillColor(sf::Color(255, 200, 200));
+                CenterTextAt(heading, kWindowWidth * 0.5f, 280.0f);
+                window.draw(heading);
+
+                sf::Text msg(uiFont, kFailureMessage, 36u);
+                msg.setFillColor(sf::Color(255, 230, 150));
+                CenterTextAt(msg, kWindowWidth * 0.5f, 345.0f);
+                window.draw(msg);
+
+                sf::Text hint(uiFont, "Press Space to retry this level", 22u);
+                hint.setFillColor(sf::Color(255, 180, 180));
+                CenterTextAt(hint, kWindowWidth * 0.5f, 500.0f);
+                window.draw(hint);
+            }
+        }
+
+        // Level number (top right), drawn last so it stays readable over the scene and victory overlay.
+        if (uiFontLoaded)
+        {
+            const std::string levelStr = "Level " + std::to_string(static_cast<int>(currentLevelIndex + 1));
+            sf::Text levelHud(uiFont, levelStr, 28u);
+            levelHud.setFillColor(sf::Color::White);
+            levelHud.setOutlineThickness(2.0f);
+            levelHud.setOutlineColor(sf::Color(0, 0, 0, 200));
+            const sf::FloatRect lb = levelHud.getLocalBounds();
+            levelHud.setOrigin(sf::Vector2f{ lb.position.x + lb.size.x, lb.position.y });
+            levelHud.setPosition(sf::Vector2f{ kWindowWidth - 18.0f, 16.0f });
+            window.draw(levelHud);
+        }
+
         window.display();
     }
 
