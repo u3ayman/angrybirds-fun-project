@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <vector>
 
@@ -33,6 +34,51 @@ constexpr float kPigMaxHealth = 200.0f;
 constexpr float kLevelDamageWarmupSeconds = 0.75f;
 constexpr float kBirdWakeThresholdSpeed2 = 0.04f;
 constexpr float kStabilizeSpeedThreshold2 = 0.0025f; // (m/s)^2 — used to detect "settled" during pre-sim
+
+// Bird / pig textures (files in the same folder as Game.exe). First match wins.
+constexpr const char* kBirdTextureCandidates[] = {
+    "circle-vector-flag-iran-banner-circle-vector-flag-iran-banner-national-symbol-middle-east-country-iranian-flag-badge-221157105.png",
+    "circle-vector-flag.png",
+};
+constexpr const char* kPigTextureCandidates[] = {
+    "images.png",
+};
+constexpr const char* kBackgroundTextureCandidates[] = {
+    "Backgournd.jpg", // filename as on disk (typo in asset name)
+    "Background.jpg",
+};
+
+bool LoadFirstAvailableTexture(sf::Texture& tex, const char* const* paths, std::size_t pathCount)
+{
+    for (std::size_t i = 0; i < pathCount; ++i)
+    {
+        if (tex.loadFromFile(paths[i]))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MakeSolidTexture(sf::Texture& tex, sf::Color color, unsigned int side = 128)
+{
+    sf::Image image;
+    image.resize({side, side}, color);
+    static_cast<void>(tex.loadFromImage(image));
+}
+
+// Scale texture to fit a circle of diameter 2*radiusPx; origin at center for physics sync.
+void SetupSpriteForPhysicsCircle(sf::Sprite& sprite, const sf::Texture& tex, float radiusPx)
+{
+    sprite.setTexture(tex, true);
+    const sf::Vector2u szU = tex.getSize();
+    const float w = static_cast<float>(std::max(1u, szU.x));
+    const float h = static_cast<float>(std::max(1u, szU.y));
+    const float diameter = radiusPx * 2.0f;
+    const float scale = diameter / std::max(w, h);
+    sprite.setScale({scale, scale});
+    sprite.setOrigin({w * 0.5f, h * 0.5f});
+}
 
 // --- Coordinate and vector helpers (screen pixels vs physics meters) --------
 sf::Vector2f ToPixels(const b2Vec2& meters)
@@ -74,11 +120,11 @@ sf::Vector2f ClampPull(const sf::Vector2f& origin, const sf::Vector2f& dragged)
 }
 
 // --- Game object types --------------------------------------------------------
-// Each moving thing has: (1) b2BodyId in Box2D, (2) an SFML shape for drawing.
+// Each moving thing has: (1) b2BodyId in Box2D, (2) an SFML drawable (shape or sprite).
 struct Bird
 {
     b2BodyId bodyId = b2_nullBodyId;
-    sf::CircleShape shape;
+    sf::Sprite sprite;
     bool launched = false;
     bool dragging = false;
     sf::Vector2f dragPositionPx;
@@ -116,7 +162,7 @@ struct BodyTag
 struct Pig
 {
     b2BodyId bodyId = b2_nullBodyId;
-    sf::CircleShape shape;
+    sf::Sprite sprite;
     bool alive = true;
     float health = 100.0f;
 };
@@ -188,11 +234,9 @@ b2BodyId CreateStaticBoxBody(b2WorldId worldId, const sf::Vector2f& centerPx, co
     return bodyId;
 }
 
-// Bird: dynamic circle; userData points at BodyTag so collisions can identify it.
-Bird CreateBird(b2WorldId worldId, BodyTag* tag)
+// Bird: dynamic circle collider; sprite is the flag image (scaled to kBirdRadiusPx).
+Bird CreateBird(b2WorldId worldId, BodyTag* tag, const sf::Texture& birdTexture)
 {
-    Bird bird;
-
     b2BodyDef bodyDef = b2DefaultBodyDef();
     bodyDef.type = b2_dynamicBody;
     bodyDef.position = ToMeters(sf::Vector2f{ kSlingshotX, kSlingshotY });
@@ -201,7 +245,7 @@ Bird CreateBird(b2WorldId worldId, BodyTag* tag)
     bodyDef.angularDamping = 0.4f;
     bodyDef.userData = tag;
 
-    bird.bodyId = b2CreateBody(worldId, &bodyDef);
+    const b2BodyId bodyId = b2CreateBody(worldId, &bodyDef);
 
     b2ShapeDef shapeDef = b2DefaultShapeDef();
     shapeDef.density = 3.5f;
@@ -212,20 +256,17 @@ Bird CreateBird(b2WorldId worldId, BodyTag* tag)
     b2Circle circle{};
     circle.center = b2Vec2{ 0.0f, 0.0f };
     circle.radius = kBirdRadiusPx / kPixelsPerMeter;
-    b2CreateCircleShape(bird.bodyId, &shapeDef, &circle);
+    b2CreateCircleShape(bodyId, &shapeDef, &circle);
 
-    bird.shape = sf::CircleShape(kBirdRadiusPx);
-    bird.shape.setOrigin(sf::Vector2f{ kBirdRadiusPx, kBirdRadiusPx });
-    bird.shape.setFillColor(sf::Color(220, 50, 50));
-
-    // Placeholder texture code for a sprite-based version:
-    // sf::Texture birdTexture;
-    // birdTexture.loadFromFile("assets/bird.png");
-    // sf::Sprite birdSprite;
-    // birdSprite.setTexture(birdTexture);
-
-    bird.dragPositionPx = { kSlingshotX, kSlingshotY };
-    return bird;
+    Bird result{
+        bodyId,
+        sf::Sprite(birdTexture),
+        false,
+        false,
+        { kSlingshotX, kSlingshotY },
+    };
+    SetupSpriteForPhysicsCircle(result.sprite, birdTexture, kBirdRadiusPx);
+    return result;
 }
 
 // Block: dynamic box by default; bodyType kept for flexibility (currently always dynamic in loadLevel).
@@ -267,11 +308,9 @@ Block CreateBlock(b2WorldId worldId, const sf::Vector2f& centerPx, const sf::Vec
     return block;
 }
 
-// Pig: dynamic circle target; index in BodyTag routes hit events to pigs[i].
-Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2BodyType bodyType)
+// Pig: dynamic circle target; sprite uses images.png (scaled to kPigRadiusPx).
+Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2BodyType bodyType, const sf::Texture& pigTexture)
 {
-    Pig pig;
-
     b2BodyDef bodyDef = b2DefaultBodyDef();
     bodyDef.type = bodyType;
     bodyDef.position = ToMeters(centerPx);
@@ -280,7 +319,7 @@ Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2B
     bodyDef.angularDamping = 0.35f;
     bodyDef.userData = tag;
 
-    pig.bodyId = b2CreateBody(worldId, &bodyDef);
+    const b2BodyId bodyId = b2CreateBody(worldId, &bodyDef);
 
     b2ShapeDef shapeDef = b2DefaultShapeDef();
     shapeDef.density = 1.2f;
@@ -291,15 +330,16 @@ Pig CreatePig(b2WorldId worldId, const sf::Vector2f& centerPx, BodyTag* tag, b2B
     b2Circle circle{};
     circle.center = b2Vec2{ 0.0f, 0.0f };
     circle.radius = kPigRadiusPx / kPixelsPerMeter;
-    b2CreateCircleShape(pig.bodyId, &shapeDef, &circle);
+    b2CreateCircleShape(bodyId, &shapeDef, &circle);
 
-    pig.shape = sf::CircleShape(kPigRadiusPx);
-    pig.shape.setOrigin(sf::Vector2f{ kPigRadiusPx, kPigRadiusPx });
-    pig.shape.setFillColor(sf::Color(70, 200, 70));
-    pig.alive = true;
-    pig.health = kPigMaxHealth;
-
-    return pig;
+    Pig result{
+        bodyId,
+        sf::Sprite(pigTexture),
+        true,
+        kPigMaxHealth,
+    };
+    SetupSpriteForPhysicsCircle(result.sprite, pigTexture, kPigRadiusPx);
+    return result;
 }
 
 // Copy physics transform to the drawable each frame (position + rotation from b2Rot).
@@ -311,6 +351,16 @@ void SyncShapeWithBody(sf::Shape& shape, b2BodyId bodyId)
     const b2Rot rot = b2Body_GetRotation(bodyId);
     const float angleRadians = std::atan2(rot.s, rot.c);
     shape.setRotation(sf::radians(angleRadians));
+}
+
+void SyncSpriteWithBody(sf::Sprite& sprite, b2BodyId bodyId)
+{
+    const b2Vec2 position = b2Body_GetPosition(bodyId);
+    sprite.setPosition(ToPixels(position));
+
+    const b2Rot rot = b2Body_GetRotation(bodyId);
+    const float angleRadians = std::atan2(rot.s, rot.c);
+    sprite.setRotation(sf::radians(angleRadians));
 }
 
 // Cheap circle overlap in pixel space (used for bird instant-kill on pig touch).
@@ -375,6 +425,40 @@ int main()
             soundPigDeath->play();
         }
     };
+
+    // --- Textures: flag PNG for bird, images.png for pigs, Backgournd.jpg / Background.jpg (solid fallback if missing) ---
+    sf::Texture textureBird;
+    sf::Texture texturePig;
+    sf::Texture textureBackground;
+    {
+        constexpr std::size_t kBirdTexCount = sizeof(kBirdTextureCandidates) / sizeof(kBirdTextureCandidates[0]);
+        constexpr std::size_t kPigTexCount = sizeof(kPigTextureCandidates) / sizeof(kPigTextureCandidates[0]);
+        constexpr std::size_t kBgTexCount = sizeof(kBackgroundTextureCandidates) / sizeof(kBackgroundTextureCandidates[0]);
+        if (!LoadFirstAvailableTexture(textureBird, kBirdTextureCandidates, kBirdTexCount))
+        {
+            MakeSolidTexture(textureBird, sf::Color(220, 50, 50));
+        }
+        if (!LoadFirstAvailableTexture(texturePig, kPigTextureCandidates, kPigTexCount))
+        {
+            MakeSolidTexture(texturePig, sf::Color(70, 200, 70));
+        }
+        if (!LoadFirstAvailableTexture(textureBackground, kBackgroundTextureCandidates, kBgTexCount))
+        {
+            MakeSolidTexture(textureBackground, sf::Color(150, 200, 255));
+        }
+    }
+
+    sf::Sprite backgroundSprite(textureBackground);
+    {
+        const sf::Vector2u texSize = textureBackground.getSize();
+        if (texSize.x > 0u && texSize.y > 0u)
+        {
+            backgroundSprite.setScale(sf::Vector2f{
+                kWindowWidth / static_cast<float>(texSize.x),
+                kWindowHeight / static_cast<float>(texSize.y),
+            });
+        }
+    }
 
     // --- Box2D world ------------------------------------------------------------
     b2WorldDef worldDef = b2DefaultWorldDef();
@@ -448,7 +532,8 @@ int main()
     std::size_t currentLevelIndex = 0;
 
     // --- Runtime state for current level ----------------------------------------
-    Bird bird;
+    // optional: SFML 3 Sprite has no default ctor; bird is created in loadLevel().
+    std::optional<Bird> bird;
     std::vector<Pig> pigs;
     std::vector<Block> blocks;
     // Parallel tags[i] for bird + each pig + each block; pointers stored in body userData.
@@ -538,7 +623,10 @@ int main()
     // Tear down previous bodies, spawn level from data, pre-simulate, reset lives.
     auto loadLevel = [&](std::size_t levelIndex)
     {
-        DestroyIfValid(bird.bodyId);
+        if (bird.has_value())
+        {
+            DestroyIfValid(bird->bodyId);
+        }
         for (Pig& p : pigs)
         {
             DestroyIfValid(p.bodyId);
@@ -556,7 +644,7 @@ int main()
 
         tags.reserve(1 + static_cast<std::size_t>(levels[levelIndex].pigCentersPx.size()) + levels[levelIndex].blocks.size());
         tags.push_back(BodyTag{ .kind = Kind::Bird, .material = Material::Stone, .index = -1 });
-        bird = CreateBird(worldId, &tags[0]);
+        bird.emplace(CreateBird(worldId, &tags[0], textureBird));
 
         // Pigs (up to 4).
         pigs.reserve(levels[levelIndex].pigCentersPx.size());
@@ -567,7 +655,7 @@ int main()
             pigPos.y = std::max(pigPos.y, pigMinY);
 
             tags.push_back(BodyTag{ .kind = Kind::Pig, .material = Material::Ice, .index = static_cast<int>(pigs.size()) });
-            pigs.push_back(CreatePig(worldId, pigPos, &tags.back(), b2_dynamicBody));
+            pigs.push_back(CreatePig(worldId, pigPos, &tags.back(), b2_dynamicBody, texturePig));
         }
 
         blocks.reserve(levels[levelIndex].blocks.size());
@@ -671,47 +759,47 @@ int main()
             else if (const auto* pressed = event->getIf<sf::Event::MouseButtonPressed>())
             {
                 // Start drag if click is near bird and this bird hasn't been launched yet.
-                if (!bird.launched && pressed->button == sf::Mouse::Button::Left)
+                if (!bird->launched && pressed->button == sf::Mouse::Button::Left)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(pressed->position.x), static_cast<float>(pressed->position.y));
-                    const sf::Vector2f birdCenterPx = ToPixels(b2Body_GetPosition(bird.bodyId));
+                    const sf::Vector2f birdCenterPx = ToPixels(b2Body_GetPosition(bird->bodyId));
                     const float distance = Length(mousePx - birdCenterPx);
                     if (distance <= kBirdRadiusPx * 1.5f)
                     {
-                        bird.dragging = true;
+                        bird->dragging = true;
                     }
                 }
             }
             else if (const auto* moved = event->getIf<sf::Event::MouseMoved>())
             {
                 // While dragging: clamp rubber-band, teleport bird body, clear velocity (slingshot aim).
-                if (bird.dragging)
+                if (bird->dragging)
                 {
                     const sf::Vector2f mousePx(static_cast<float>(moved->position.x), static_cast<float>(moved->position.y));
-                    bird.dragPositionPx = ClampPull({ kSlingshotX, kSlingshotY }, mousePx);
-                    b2Body_SetTransform(bird.bodyId, ToMeters(bird.dragPositionPx), b2MakeRot(0.0f));
-                    b2Body_SetLinearVelocity(bird.bodyId, b2Vec2{ 0.0f, 0.0f });
-                    b2Body_SetAngularVelocity(bird.bodyId, 0.0f);
-                    b2Body_SetAwake(bird.bodyId, true);
+                    bird->dragPositionPx = ClampPull({ kSlingshotX, kSlingshotY }, mousePx);
+                    b2Body_SetTransform(bird->bodyId, ToMeters(bird->dragPositionPx), b2MakeRot(0.0f));
+                    b2Body_SetLinearVelocity(bird->bodyId, b2Vec2{ 0.0f, 0.0f });
+                    b2Body_SetAngularVelocity(bird->bodyId, 0.0f);
+                    b2Body_SetAwake(bird->bodyId, true);
                 }
             }
             else if (const auto* released = event->getIf<sf::Event::MouseButtonReleased>())
             {
                 // Release: fire bird — impulse from pull vector, spend one life, play launch SFX.
-                if (bird.dragging && released->button == sf::Mouse::Button::Left)
+                if (bird->dragging && released->button == sf::Mouse::Button::Left)
                 {
-                    bird.dragging = false;
-                    bird.launched = true;
+                    bird->dragging = false;
+                    bird->launched = true;
                     birdsRemaining = std::max(0, birdsRemaining - 1);
                     birdIdleSeconds = 0.0f;
                     updateTitle();
 
                     const sf::Vector2f slingshotOriginPx(kSlingshotX, kSlingshotY);
-                    const sf::Vector2f pullPx = slingshotOriginPx - bird.dragPositionPx;
+                    const sf::Vector2f pullPx = slingshotOriginPx - bird->dragPositionPx;
                     const b2Vec2 pullMeters = ToMeters(pullPx);
                     const b2Vec2 impulse = b2Vec2{ pullMeters.x * kLaunchStrength, pullMeters.y * kLaunchStrength };
-                    b2Body_SetAwake(bird.bodyId, true);
-                    b2Body_ApplyLinearImpulseToCenter(bird.bodyId, impulse, true);
+                    b2Body_SetAwake(bird->bodyId, true);
+                    b2Body_ApplyLinearImpulseToCenter(bird->bodyId, impulse, true);
                     playLaunchSound();
                 }
             }
@@ -797,11 +885,11 @@ int main()
         }
 
         // Backup kill: if bird circle overlaps pig circle, kill pig (handles edge cases vs hit events).
-        if (!paused && bird.launched)
+        if (!paused && bird->launched)
         {
             for (Pig& p : pigs)
             {
-                if (p.alive && AreBodiesOverlappingAsCircles(bird.bodyId, kBirdRadiusPx, p.bodyId, kPigRadiusPx))
+                if (p.alive && AreBodiesOverlappingAsCircles(bird->bodyId, kBirdRadiusPx, p.bodyId, kPigRadiusPx))
                 {
                     p.alive = false;
                     p.health = 0.0f;
@@ -833,15 +921,15 @@ int main()
         }
 
         // --- Bird spent: despawn when off-screen or nearly stopped; respawn or fail level -------
-        if (!paused && bird.launched && B2_IS_NON_NULL(bird.bodyId))
+        if (!paused && bird->launched && B2_IS_NON_NULL(bird->bodyId))
         {
-            const sf::Vector2f birdPx = ToPixels(b2Body_GetPosition(bird.bodyId));
+            const sf::Vector2f birdPx = ToPixels(b2Body_GetPosition(bird->bodyId));
             const float margin = 200.0f;
             const bool outOfBounds =
                 birdPx.x < -margin || birdPx.x > (kWindowWidth + margin) ||
                 birdPx.y < -margin || birdPx.y > (kWindowHeight + margin);
 
-            const b2Vec2 v = b2Body_GetLinearVelocity(bird.bodyId);
+            const b2Vec2 v = b2Body_GetLinearVelocity(bird->bodyId);
             const float speed2 = v.x * v.x + v.y * v.y;
             if (speed2 < kBirdWakeThresholdSpeed2)
             {
@@ -855,13 +943,13 @@ int main()
             if (outOfBounds || birdIdleSeconds > 1.25f)
             {
                 // Remove used bird and spawn a new one if available; otherwise restart level.
-                DestroyIfValid(bird.bodyId);
-                bird = Bird();
+                DestroyIfValid(bird->bodyId);
+                bird.reset();
 
                 if (birdsRemaining > 0)
                 {
                     // Recreate bird body using existing bird tag (tags[0]).
-                    bird = CreateBird(worldId, &tags[0]);
+                    bird.emplace(CreateBird(worldId, &tags[0], textureBird));
                     updateTitle();
                 }
                 else
@@ -874,20 +962,20 @@ int main()
         }
 
         // --- Sync physics → sprites (dragging bird uses mouse position, not body) --------------
-        if (bird.dragging)
+        if (bird->dragging)
         {
-            bird.shape.setPosition(bird.dragPositionPx);
+            bird->sprite.setPosition(bird->dragPositionPx);
         }
         else
         {
-            SyncShapeWithBody(bird.shape, bird.bodyId);
+            SyncSpriteWithBody(bird->sprite, bird->bodyId);
         }
 
         for (Pig& p : pigs)
         {
             if (p.alive)
             {
-                SyncShapeWithBody(p.shape, p.bodyId);
+                SyncSpriteWithBody(p.sprite, p.bodyId);
             }
         }
 
@@ -898,25 +986,26 @@ int main()
 
         // --- Draw frame -------------------------------------------------------------
         window.clear(sf::Color(150, 200, 255));
+        window.draw(backgroundSprite);
         window.draw(groundShape);
         window.draw(slingBase);
 
         // Aiming helpers (line + trajectory preview).
-        if (bird.dragging)
+        if (bird->dragging)
         {
             const sf::Vector2f slingshotOriginPx(kSlingshotX, kSlingshotY);
             aimLine[0].position = slingshotOriginPx;
-            aimLine[1].position = bird.dragPositionPx;
+            aimLine[1].position = bird->dragPositionPx;
             window.draw(aimLine);
 
             // Trajectory prediction (simple ballistic approximation).
-            const sf::Vector2f pullPx = slingshotOriginPx - bird.dragPositionPx;
+            const sf::Vector2f pullPx = slingshotOriginPx - bird->dragPositionPx;
             const b2Vec2 pullMeters = ToMeters(pullPx);
             const b2Vec2 impulse = b2Vec2{ pullMeters.x * kLaunchStrength, pullMeters.y * kLaunchStrength };
-            const float mass = b2Body_GetMass(bird.bodyId);
+            const float mass = b2Body_GetMass(bird->bodyId);
             const b2Vec2 v0 = (mass > 0.0001f) ? b2Vec2{ impulse.x / mass, impulse.y / mass } : b2Vec2{ 0.0f, 0.0f };
             const b2Vec2 g = b2World_GetGravity(worldId);
-            const b2Vec2 p0 = ToMeters(bird.dragPositionPx);
+            const b2Vec2 p0 = ToMeters(bird->dragPositionPx);
 
             constexpr int kDots = 20;
             constexpr float kStepSeconds = 0.08f;
@@ -937,12 +1026,12 @@ int main()
             }
         }
 
-        window.draw(bird.shape);
+        window.draw(bird->sprite);
         for (const Pig& p : pigs)
         {
             if (p.alive)
             {
-                window.draw(p.shape);
+                window.draw(p.sprite);
             }
         }
         for (const Block& block : blocks)
