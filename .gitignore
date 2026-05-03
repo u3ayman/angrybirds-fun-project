@@ -1,0 +1,20 @@
+# Build output
+Game.exe
+*.o
+*.obj
+*.out
+
+# Runtime DLLs copied next to the exe (rebuild from MSYS2 if needed)
+*.dll
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Cursor / tooling
+.cursor/
