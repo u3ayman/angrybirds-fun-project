@@ -4,6 +4,7 @@ Game.exe
 *.obj
 *.out
 Game_build.exe
+Game_new.exe
 # Runtime DLLs copied next to the exe (rebuild from MSYS2 if needed)
 *.dll
 
